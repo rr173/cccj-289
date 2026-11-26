@@ -64,7 +64,10 @@ CREATE TABLE IF NOT EXISTS counters (
 CREATE TABLE IF NOT EXISTS customers (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    -- Set when the customer registers their first prepaid top-up; every event
+    -- accepted afterwards is billable.  NULL = no credits in force.
+    credits_effective_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -93,6 +96,9 @@ CREATE TABLE IF NOT EXISTS events (
     caller_event_id TEXT NOT NULL,
     topic_id        TEXT,
     status          TEXT NOT NULL DEFAULT 'active',
+    -- 1 only for events accepted after the customer's first prepaid top-up
+    -- became effective.  Deliveries copy this flag and need one point each.
+    billable        INTEGER NOT NULL DEFAULT 0,
     payload_json    TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
     seq             INTEGER NOT NULL,
@@ -112,6 +118,22 @@ CREATE TABLE IF NOT EXISTS deliveries (
     target_url      TEXT NOT NULL,
     target_version  INTEGER NOT NULL,
     status          TEXT NOT NULL,
+    -- 1 when this delivery needs one prepaid point (billable event).
+    billable        INTEGER NOT NULL DEFAULT 0,
+    -- credit_stage: none | needed | held | charged | returned | expired | reconciliation
+    --   none            not billable, no point involved
+    --   needed          billable but no point allocated yet (claimed, cannot send)
+    --   held            one point reserved for this delivery's delivery_id
+    --   charged         held point consumed after a confirmed 2xx
+    --   returned        held point released (no request was in flight)
+    --   expired         point returned after its top-up's expiry, unspendable
+    --   reconciliation  send outcome unknown; held point kept pending customer confirmation
+    credit_stage    TEXT NOT NULL DEFAULT 'none',
+    credit_id       TEXT,
+    reconciliation_reason TEXT,
+    reconciliation_state  TEXT,  -- None | received | not_received
+    reconciliation_note   TEXT,
+    reconciliation_at     REAL,
     attempt_seq     INTEGER NOT NULL DEFAULT 0,
     attempts_count  INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL,
@@ -210,16 +232,75 @@ CREATE INDEX IF NOT EXISTS ix_ticket_evidence_event
     ON ticket_evidence(event_id);
 CREATE INDEX IF NOT EXISTS ix_ticket_evidence_ticket
     ON ticket_evidence(ticket_id);
+
+-- Prepaid credit top-ups.  ``topup_ref`` is unique per customer, so the same
+-- reference + same (points, expires_at) is one top-up and a differing retry
+-- is rejected.  Points still unspent after ``expires_at`` become ``expired``.
+CREATE TABLE IF NOT EXISTS credit_topups (
+    id          TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL REFERENCES customers(id),
+    topup_ref   TEXT NOT NULL,
+    points      INTEGER NOT NULL,
+    expires_at  REAL NOT NULL,
+    created_at  REAL NOT NULL,
+    UNIQUE (customer_id, topup_ref)
+);
+
+CREATE INDEX IF NOT EXISTS ix_credit_topups_customer
+    ON credit_topups(customer_id, expires_at, topup_ref);
+
+-- One row per point a delivery_id has consumed / is holding.  ``stage``:
+--   held    reserved for delivery_id (counts against open + chargeable quota)
+--   charged consumed by a confirmed 2xx
+--   returned released without a request ever being handed to the sender
+--   expired released after the top-up expired (counts as expired, not spendable)
+-- A single row can move held->charged *or* held->returned/expired, never both,
+-- because every transition is guarded by the current ``stage``.
+CREATE TABLE IF NOT EXISTS credit_allocations (
+    id           TEXT PRIMARY KEY,
+    delivery_id  TEXT NOT NULL REFERENCES deliveries(id),
+    customer_id  TEXT NOT NULL,
+    topup_id     TEXT REFERENCES credit_topups(id),
+    points       INTEGER NOT NULL DEFAULT 1,
+    stage        TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    settled_at   REAL,
+    released_expired INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_alloc_held
+    ON credit_allocations(delivery_id) WHERE stage IN ('held','charged');
+CREATE INDEX IF NOT EXISTS ix_credit_alloc_topup
+    ON credit_allocations(topup_id, stage);
+CREATE INDEX IF NOT EXISTS ix_credit_alloc_delivery
+    ON credit_allocations(delivery_id);
 """
 
-# Delivery statuses from which no further claiming / retry may happen.
 TERMINAL_STATUSES = ("succeeded", "administratively_skipped", "withdrawn")
+# Attempt outcomes that may have reached the receiver without a usable
+# delivery verdict.  Any such attempt left after a delivery is stopped means
+# the held point may already have been consumed; it is kept and parked for
+# customer reconciliation instead of being silently refunded.
+UNRESOLVED_OUTCOMES = (
+    "in_flight",
+    "expired",
+    "timeout",
+    "transport_error",
+    "superseded_target",
+    "lease_lost",
+)
+# Delivery statuses from which no further claiming / retry may happen.
+
 # Sentinel stored in events.content_hash after erasure (column stays NOT NULL
 # for databases created by older versions).
 ERASED_HASH = ""
 ERASED_PAYLOAD = "null"
 WITHDRAWN_REASON = "topic_withdrawn"
 REDACTED_TEXT = "error detail removed when the topic was withdrawn"
+# Reconciliation states a customer may record for a stopped, unresolved delivery.
+RECONCILED_RECEIVED = "received"
+RECONCILED_NOT_RECEIVED = "not_received"
+
 
 
 @dataclass(frozen=True)
@@ -241,6 +322,7 @@ class ClaimedDelivery:
     caller_event_id: str
     payload_json: str
     event_created_at: float
+    billable: bool = False
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -274,6 +356,32 @@ class Store:
             )
             self._add_column_if_missing(
                 conn, "attempts", "send_started_at", "send_started_at REAL"
+            )
+            # ---- prepaid credits (additive; old rows are non-billable) ----
+            self._add_column_if_missing(
+                conn, "customers", "credits_effective_at", "credits_effective_at REAL"
+            )
+            self._add_column_if_missing(
+                conn, "events", "billable", "billable INTEGER NOT NULL DEFAULT 0"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "billable", "billable INTEGER NOT NULL DEFAULT 0"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "credit_stage", "credit_stage TEXT NOT NULL DEFAULT 'none'"
+            )
+            self._add_column_if_missing(conn, "deliveries", "credit_id", "credit_id TEXT")
+            self._add_column_if_missing(
+                conn, "deliveries", "reconciliation_reason", "reconciliation_reason TEXT"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "reconciliation_state", "reconciliation_state TEXT"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "reconciliation_note", "reconciliation_note TEXT"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "reconciliation_at", "reconciliation_at REAL"
             )
             # Created after the additive migration because the index references
             # a column that pre-existing ``events`` tables only gain above.
@@ -347,6 +455,32 @@ class Store:
         items = list(values)
         return "(" + ",".join("?" for _ in items) + ")", items
 
+    @staticmethod
+    def _supply_predicate(now_param: str = "?") -> str:
+        """SQL predicate: one more point could be allocated for delivery ``d``.
+
+        Used by ``claim_due`` / ``next_wakeup`` so a customer that is out of
+        points is not spun on (and does not crowd out other flows or
+        customers).  A billable delivery that still needs a point is claimable
+        only while the customer has a non-expired top-up with a free point;
+        deliveries that already hold a point, or that are non-billable, are
+        always claimable.
+        """
+        return (
+            "(d.billable = 0"
+            " OR d.credit_stage != 'needed'"
+            " OR EXISTS ("
+            "   SELECT 1 FROM credit_topups ct"
+            "   WHERE ct.customer_id = d.customer_id"
+            f"     AND ct.expires_at > {now_param}"
+            "     AND ct.points - COALESCE(("
+            "       SELECT SUM(ca.points) FROM credit_allocations ca"
+            "       WHERE ca.topup_id = ct.id"
+            "         AND ca.stage IN ('held','charged','expired')"
+            "     ),0) > 0"
+            " ))"
+        )
+
     def _checkpoint_truncate(self) -> None:
         """Best-effort WAL truncation + compaction after content erasure.
 
@@ -405,7 +539,7 @@ class Store:
             # this subscription's clock reading but before this insert.
             # Withdrawn events are never fanned out to a new subscription.
             rows = conn.execute(
-                """SELECT id, flow_id, seq FROM events
+                """SELECT id, flow_id, seq, billable FROM events
                    WHERE customer_id=? AND ordinal > ? AND status != 'withdrawn'
                    ORDER BY ordinal""",
                 (customer_id, ordinal),
@@ -421,6 +555,7 @@ class Store:
                     target_url=target_url,
                     target_version=1,
                     now=now,
+                    billable=bool(row["billable"]),
                 )
         return self.get_subscription(subscription_id)
 
@@ -502,6 +637,13 @@ class Store:
         digest = content_digest(canonical)
 
         with self._write() as conn:
+            # Billable only once the customer's first top-up has taken effect.
+            # The top-up registration writes ``credits_effective_at`` inside a
+            # BEGIN IMMEDIATE transaction, so this read is serialised against it.
+            cust = conn.execute(
+                "SELECT credits_effective_at FROM customers WHERE id=?", (customer_id,)
+            ).fetchone()
+            billable = cust is not None and cust["credits_effective_at"] is not None
             topic_withdrawn = False
             if topic_id is not None:
                 # Insert the implicit active topic first; the conflict is a
@@ -559,9 +701,21 @@ class Store:
             event_id = new_id("evt")
             conn.execute(
                 """INSERT INTO events(id, customer_id, flow_id, caller_event_id, topic_id, status,
-                                      payload_json, content_hash, seq, ordinal, created_at)
-                   VALUES (?,?,?,?,?, 'active', ?,?,?,?,?)""",
-                (event_id, customer_id, flow_id, caller_event_id, topic_id, canonical, digest, seq, ordinal, now),
+                                      billable, payload_json, content_hash, seq, ordinal, created_at)
+                   VALUES (?,?,?,?,?, 'active', ?,?,?,?,?,?)""",
+                (
+                    event_id,
+                    customer_id,
+                    flow_id,
+                    caller_event_id,
+                    topic_id,
+                    1 if billable else 0,
+                    canonical,
+                    digest,
+                    seq,
+                    ordinal,
+                    now,
+                ),
             )
             subscriptions = conn.execute(
                 "SELECT id, target_url, target_version FROM subscriptions WHERE customer_id=? AND ordinal < ?",
@@ -578,6 +732,7 @@ class Store:
                     target_url=sub["target_url"],
                     target_version=int(sub["target_version"]),
                     now=now,
+                    billable=billable,
                 )
             stored = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
             return self._event_result(conn, stored, replayed=False)
@@ -652,6 +807,7 @@ class Store:
         target_url: str,
         target_version: int,
         now: float,
+        billable: bool = False,
     ) -> None:
         prev = conn.execute(
             """SELECT id, status FROM deliveries
@@ -662,12 +818,14 @@ class Store:
         blocked_by = None
         if prev is not None and prev["status"] not in TERMINAL_STATUSES:
             blocked_by = prev["id"]
+        credit_stage = "needed" if billable else "none"
         conn.execute(
             """INSERT INTO deliveries(id, event_id, subscription_id, customer_id, flow_id, seq,
-                                      target_url, target_version, status, attempts_count,
+                                      target_url, target_version, status, billable, credit_stage,
+                                      attempts_count,
                                       next_attempt_at, blocked_by, block_reason,
                                       created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?, 'pending', 0, NULL, ?, ?, ?, ?)""",
+               VALUES (?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, NULL, ?, ?, ?, ?)""",
             (
                 new_id("dlv"),
                 event_id,
@@ -677,6 +835,8 @@ class Store:
                 seq,
                 target_url,
                 target_version,
+                1 if billable else 0,
+                credit_stage,
                 blocked_by,
                 "predecessor_incomplete" if blocked_by else None,
                 now,
@@ -753,6 +913,15 @@ class Store:
                 # Terminate every delivery not already confirmed in a terminal
                 # success/skip state.  Lease fields are intentionally left in
                 # place: finish_attempt fences on status before the token.
+                terminating = [
+                    r["id"]
+                    for r in conn.execute(
+                        f"""SELECT id FROM deliveries
+                            WHERE event_id IN {in_sql}
+                              AND status NOT IN ('succeeded','administratively_skipped','withdrawn')""",
+                        params,
+                    ).fetchall()
+                ]
                 cur = conn.execute(
                     f"""UPDATE deliveries
                         SET status='withdrawn', next_attempt_at=NULL,
@@ -768,6 +937,8 @@ class Store:
                 # their in-flight attempt rows now.  Attempts with
                 # send_started_at set correspond to requests already handed to
                 # the HTTP sender; leave those for the fenced finish path.
+                # (The credit settlement below runs *after* this, so an attempt
+                # that never left the gate counts as "no request in flight".)
                 conn.execute(
                     f"""UPDATE attempts
                         SET outcome='withdrawn', finished_at=?, error=NULL
@@ -775,6 +946,23 @@ class Store:
                           AND delivery_id IN (SELECT id FROM deliveries WHERE event_id IN {in_sql})""",
                     [now, *params],
                 )
+
+                # Prepaid points held by terminated deliveries: return the
+                # point when no request could have reached the receiver, or
+                # park it for reconciliation when one may have.  Settled after
+                # the attempt close above so unsent claims are recognisably
+                # unresolved-free.  Charged points are never touched.
+                credit_reconciled = 0
+                credit_released = 0
+                credit_expired = 0
+                for dlv_id in terminating:
+                    stage = self._settle_stopped_delivery(conn, delivery_id=dlv_id, now=now)
+                    if stage == "reconciliation":
+                        credit_reconciled += 1
+                    elif stage == "returned":
+                        credit_released += 1
+                    elif stage == "expired":
+                        credit_expired += 1
 
                 # Scrub upstream free text everywhere it may have echoed the
                 # payload (receiver error bodies, late-result observations).
@@ -828,6 +1016,9 @@ class Store:
                 ).fetchone()
             else:
                 totals = None
+                credit_reconciled = 0
+                credit_released = 0
+                credit_expired = 0
 
             held: sqlite3.Row | dict[str, int]
             if event_ids:
@@ -864,6 +1055,9 @@ class Store:
                 "deliveries_skipped": int(totals["skipped"] or 0) if totals else 0,
                 "deliveries_withdrawn": int(totals["withdrawn"] or 0) if totals else 0,
                 "deliveries_total": int(totals["total"] or 0) if totals else 0,
+                "credits_reconciled": credit_reconciled,
+                "credits_returned": credit_released,
+                "credits_expired": credit_expired,
                 "open_holds_at_withdrawal": int(held["c"] or 0),
                 "waited_for_inflight": bool(wait_for_inflight and inflight_marked),
             }
@@ -1179,6 +1373,296 @@ class Store:
         self._checkpoint_truncate()
         return self.get_ticket(ticket_id, customer_id=customer_id)
 
+    # ------------------------------------------------------- prepaid credits
+    def register_topup(
+        self,
+        customer_id: str | None = None,
+        *,
+        topup_ref: str | None = None,
+        points: int | None = None,
+        expires_at: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Register one prepaid credit top-up for a customer.
+
+        ``topup_ref`` is unique within the customer.  Re-submitting the exact
+        same ``(topup_ref, points, expires_at)`` is idempotent (``replayed``);
+        reusing the reference with a different point count or expiry is
+        rejected.  The first successful top-up makes the customer's later
+        events billable; events accepted earlier stay non-billable.
+        """
+        if now is None:
+            now = time.time()
+        topup_ref = require_text(topup_ref, "topup_ref")
+        if not isinstance(points, int) or isinstance(points, bool) or points <= 0:
+            raise DomainError(
+                "points must be a positive integer", status_code=422, code="invalid_points"
+            )
+        if expires_at is None:
+            raise DomainError(
+                "expires_at is required", status_code=422, code="invalid_expires_at"
+            )
+        expires_at = float(expires_at)
+
+        with self._write() as conn:
+            self._require_customer(conn, customer_id)
+            existing = conn.execute(
+                "SELECT * FROM credit_topups WHERE customer_id=? AND topup_ref=?",
+                (customer_id, topup_ref),
+            ).fetchone()
+            replayed = False
+            if existing is not None:
+                if int(existing["points"]) != points or float(existing["expires_at"]) != expires_at:
+                    raise DomainError(
+                        "topup_ref was already used with different points or expires_at",
+                        status_code=409,
+                        code="topup_conflict",
+                    )
+                replayed = True
+                topup_id = existing["id"]
+            else:
+                topup_id = new_id("top")
+                conn.execute(
+                    """INSERT INTO credit_topups(id, customer_id, topup_ref, points, expires_at, created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (topup_id, customer_id, topup_ref, points, expires_at, now),
+                )
+                # First top-up for this customer: events from now on are
+                # billable.  Later top-ups do not move this boundary.
+                conn.execute(
+                    """UPDATE customers SET credits_effective_at=COALESCE(credits_effective_at, ?)
+                       WHERE id=?""",
+                    (now, customer_id),
+                )
+        return self.get_topup(customer_id, topup_ref, replayed=replayed)
+
+    def get_topup(self, customer_id: str, topup_ref: str, *, replayed: bool = False) -> dict[str, Any]:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT * FROM credit_topups WHERE customer_id=? AND topup_ref=?",
+                (customer_id, topup_ref),
+            ).fetchone()
+            if row is None:
+                raise DomainError("topup not found", status_code=404, code="topup_not_found")
+            return self._topup_json(conn, row, now=time.time(), replayed=replayed)
+
+    def _topup_json(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, *, now: float, replayed: bool = False
+    ) -> dict[str, Any]:
+        expires_at = float(row["expires_at"])
+        expired_now = expires_at <= now
+        held = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(a.points),0) AS c FROM credit_allocations a
+                   JOIN credit_topups t ON t.id=a.topup_id
+                   WHERE t.id=? AND a.stage='held'""",
+                (row["id"],),
+            ).fetchone()["c"]
+        )
+        charged = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(a.points),0) AS c FROM credit_allocations a
+                   WHERE a.topup_id=? AND a.stage='charged'""",
+                (row["id"],),
+            ).fetchone()["c"]
+        )
+        row = conn.execute(
+            """SELECT COALESCE(SUM(a.points),0) AS c FROM credit_allocations a
+               WHERE a.topup_id=? AND a.stage='returned'""",
+            (row["id"],),
+        ).fetchone()
+        returned = int(row["c"])
+        expired = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(a.points),0) AS c FROM credit_allocations a
+                   WHERE a.topup_id=? AND a.stage='expired'""",
+                (row["id"],),
+            ).fetchone()["c"]
+        )
+        if expired_now:
+            # A held point on a past-expiry top-up can no longer be spent, but
+            # it stays reserved for its in-flight delivery_id until that
+            # delivery settles.  Everything not held or charged is expired.
+            unallocated = max(int(row["points"]) - held - charged, 0)
+            available = 0
+        else:
+            # ``returned`` points are back in the balance and reusable.
+            unallocated = 0
+            available = max(int(row["points"]) - held - charged - expired, 0)
+        return {
+            "topup_id": row["id"],
+            "customer_id": row["customer_id"],
+            "topup_ref": row["topup_ref"],
+            "points": int(row["points"]),
+            "expires_at": iso_time(expires_at),
+            "created_at": iso_time(row["created_at"]),
+            "expired": expired_now,
+            "available": available,
+            "held": held,
+            "charged": charged,
+            "returned": returned,
+            "expired_points": expired + (unallocated if expired_now else 0),
+            "replayed": replayed,
+        }
+
+    def list_topups(self, *, customer_id: str, now: float | None = None) -> list[dict[str, Any]]:
+        if not self.customer_exists(customer_id):
+            raise DomainError("unknown customer_id", status_code=404, code="customer_not_found")
+        if now is None:
+            now = time.time()
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM credit_topups WHERE customer_id=? ORDER BY created_at, topup_ref",
+                (customer_id,),
+            ).fetchall()
+            return [self._topup_json(conn, r, now=now) for r in rows]
+
+    def _expire_allocations(self, conn: sqlite3.Connection, *, now: float) -> None:
+        """Move points released after their top-up expired into ``expired``.
+
+        Only allocations still in the ``held`` stage whose top-up has passed
+        its expiry can be affected: an already-``held`` point stays valid for
+        its delivery_id even across expiry, so it is not touched here.  This
+        runs when a hold is released (skip/withdraw), which is the only moment
+        a point can be "returned for later use".
+        """
+        # Nothing to do here by design; returning is handled in _release_hold,
+        # which decides between 'returned' and 'expired' for this allocation.
+        return None
+
+    def _allocate_point(
+        self, conn: sqlite3.Connection, *, delivery_id: str, customer_id: str, now: float
+    ) -> bool:
+        """Reserve one point for this delivery from the earliest-expiring,
+        then lowest-topup_ref, non-expired top-up with an available balance.
+
+        Writes one ``credit_allocations`` row and links it to the delivery.
+        Returns ``False`` (allocating nothing) when no point is available, in
+        which case the caller must not send.
+        """
+        row = conn.execute(
+            """SELECT t.id
+               FROM credit_topups t
+               WHERE t.customer_id=? AND t.expires_at > ?
+                 AND (t.points
+                      - COALESCE((SELECT SUM(a2.points) FROM credit_allocations a2
+                                  WHERE a2.topup_id=t.id
+                                    AND a2.stage IN ('held','charged','expired')),0)) > 0
+               ORDER BY t.expires_at ASC, t.topup_ref ASC
+               LIMIT 1""",
+            (customer_id, now),
+        ).fetchone()
+        if row is None:
+            return False
+        alloc_id = new_id("alc")
+        conn.execute(
+            """INSERT INTO credit_allocations(id, delivery_id, customer_id, topup_id, points,
+                                              stage, created_at)
+               VALUES (?,?,?,?,1, 'held', ?)""",
+            (alloc_id, delivery_id, customer_id, row["id"], now),
+        )
+        conn.execute(
+            """UPDATE deliveries SET credit_stage='held', credit_id=?, updated_at=?
+               WHERE id=?""",
+            (alloc_id, now, delivery_id),
+        )
+        return True
+
+    def _release_hold(
+        self, conn: sqlite3.Connection, *, delivery_id: str, now: float
+    ) -> str | None:
+        """Release the *held* point of a delivery that will never send again.
+
+        Returns ``returned`` or ``expired`` (the top-up had already expired, so
+        the point joins the expired count and cannot be spent), or ``None`` when
+        the delivery holds no allocation.  Already-``charged`` points are left
+        untouched so a settlement can never both deduct and refund.
+        """
+        alloc = conn.execute(
+            "SELECT * FROM credit_allocations WHERE delivery_id=? AND stage='held'",
+            (delivery_id,),
+        ).fetchone()
+        if alloc is None:
+            return None
+        topup = conn.execute(
+            "SELECT expires_at FROM credit_topups WHERE id=?", (alloc["topup_id"],)
+        ).fetchone()
+        expired = topup is not None and float(topup["expires_at"]) <= now
+        new_stage = "expired" if expired else "returned"
+        cur = conn.execute(
+            """UPDATE credit_allocations SET stage=?, settled_at=?, released_expired=?
+               WHERE id=? AND stage='held'""",
+            (new_stage, now, 1 if expired else 0, alloc["id"]),
+        )
+        if cur.rowcount != 1:
+            return None
+        conn.execute(
+            """UPDATE deliveries SET credit_stage=?, updated_at=?
+               WHERE id=? AND credit_stage='held'""",
+            (new_stage, now, delivery_id),
+        )
+        return new_stage
+
+    def _charge_hold(self, conn: sqlite3.Connection, *, delivery_id: str, now: float) -> bool:
+        """Consume the held point after a confirmed 2xx.  Idempotent: only a
+        single held->charged transition can happen per delivery."""
+        alloc = conn.execute(
+            "SELECT * FROM credit_allocations WHERE delivery_id=? AND stage='held'",
+            (delivery_id,),
+        ).fetchone()
+        if alloc is None:
+            return False
+        cur = conn.execute(
+            """UPDATE credit_allocations SET stage='charged', settled_at=?
+               WHERE id=? AND stage='held'""",
+            (now, alloc["id"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            """UPDATE deliveries SET credit_stage='charged', updated_at=?
+               WHERE id=? AND credit_stage='held'""",
+            (now, delivery_id),
+        )
+        return True
+
+    def _has_unresolved_attempts(self, conn: sqlite3.Connection, delivery_id: str) -> bool:
+        in_sql = "(" + ",".join("?" for _ in UNRESOLVED_OUTCOMES) + ")"
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM attempts WHERE delivery_id=? AND outcome IN {in_sql}",
+            (delivery_id, *UNRESOLVED_OUTCOMES),
+        ).fetchone()
+        return int(row["c"]) > 0
+
+    def _settle_stopped_delivery(
+        self, conn: sqlite3.Connection, *, delivery_id: str, now: float
+    ) -> str | None:
+        """Settle a held point for a delivery that has just stopped.
+
+        If no attempt could have reached the receiver, the point is returned
+        (or expired if its top-up already expired).  Otherwise at least one
+        request may have been accepted with no usable verdict, so the point is
+        kept and the delivery is parked for customer reconciliation; it no
+        longer blocks its flow, and the point is never available to anyone
+        else.  Returns the resulting stage, or ``None`` when nothing was held.
+        """
+        stage_row = conn.execute(
+            "SELECT credit_stage FROM deliveries WHERE id=?", (delivery_id,)
+        ).fetchone()
+        if stage_row is None or stage_row["credit_stage"] not in ("held",):
+            return None
+        if self._has_unresolved_attempts(conn, delivery_id):
+            cur = conn.execute(
+                """UPDATE deliveries
+                   SET credit_stage='reconciliation', reconciliation_reason=?, updated_at=?
+                   WHERE id=? AND credit_stage='held'""",
+                ("unresolved_send", now, delivery_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            return "reconciliation"
+        return self._release_hold(conn, delivery_id=delivery_id, now=now)
+
     # ------------------------------------------------------- send gate/claims
     def mark_sending(self, claim: ClaimedDelivery, *, now: float) -> bool:
         """Fence between "claimed" and "HTTP request handed to the sender".
@@ -1189,7 +1673,7 @@ class Store:
         """
         with self._write() as conn:
             row = conn.execute(
-                "SELECT status, lease_token FROM deliveries WHERE id=?",
+                "SELECT status, lease_token, billable, credit_stage FROM deliveries WHERE id=?",
                 (claim.id,),
             ).fetchone()
             if row is None or row["status"] != "in_progress" or row["lease_token"] != claim.lease_token:
@@ -1205,6 +1689,32 @@ class Store:
                 return False
             if event["topic_status"] == "withdrawn":
                 return False
+            # ---- prepaid point gate -------------------------------------
+            # A billable delivery may only hand a request to the sender while
+            # it owns a point.  The allocation is written in the same write
+            # transaction as the send fence, so a point is never spent on a
+            # request that is never made, and two deliveries never share one.
+            if row["billable"]:
+                stage = row["credit_stage"]
+                if stage == "needed":
+                    if not self._allocate_point(
+                        conn, delivery_id=claim.id, customer_id=claim.customer_id, now=now
+                    ):
+                        # No point available: leave it claimed but unsent, so
+                        # the worker can park it for supply without spending a
+                        # retry.  It is not failed.
+                        return False
+                elif stage != "held":
+                    # charged / reconciliation / returned / expired: no point
+                    # is free for another send under this delivery_id.
+                    return False
+                # Re-check the lease after allocating, so a concurrent recovery
+                # cannot have handed this work to another worker meanwhile.
+                lease = conn.execute(
+                    "SELECT lease_token FROM deliveries WHERE id=?", (claim.id,)
+                ).fetchone()
+                if lease is None or lease["lease_token"] != claim.lease_token:
+                    return False
             cur = conn.execute(
                 """UPDATE attempts SET send_started_at=?
                    WHERE id=? AND outcome='in_flight' AND send_started_at IS NULL""",
@@ -1232,7 +1742,7 @@ class Store:
         claimed: list[ClaimedDelivery] = []
         with self._write() as conn:
             rows = conn.execute(
-                """SELECT d.*, e.caller_event_id AS caller_event_id,
+                f"""SELECT d.*, e.caller_event_id AS caller_event_id,
                           e.payload_json AS payload_json, e.created_at AS event_created_at
                    FROM deliveries d JOIN events e ON e.id = d.event_id
                    WHERE d.status IN ('pending','retry_wait')
@@ -1245,9 +1755,10 @@ class Store:
                            AND p.seq < d.seq
                            AND p.status NOT IN ('succeeded','administratively_skipped','withdrawn')
                      )
+                     AND {self._supply_predicate('?')}
                    ORDER BY d.created_at, d.seq
                    LIMIT ?""",
-                (now, limit * 8),
+                (now, now, limit * 8),
             ).fetchall()
             for row in rows:
                 if len(claimed) >= limit:
@@ -1314,6 +1825,7 @@ class Store:
                         caller_event_id=row["caller_event_id"],
                         payload_json=row["payload_json"],
                         event_created_at=float(row["event_created_at"]),
+                        billable=bool(row["billable"]),
                     )
                 )
         return claimed
@@ -1429,6 +1941,11 @@ class Store:
                        WHERE id=? AND lease_token=?""",
                     (now, now, claim.id, claim.lease_token),
                 )
+                # A confirmed 2xx consumes the point this delivery_id held.
+                # Guarded by stage='held', so it happens at most once even if a
+                # duplicate success reply arrives.
+                if row["billable"]:
+                    self._charge_hold(conn, delivery_id=claim.id, now=now)
                 self._unblock_successors(conn, claim.subscription_id, claim.flow_id, claim.seq, now)
                 return "succeeded"
 
@@ -1596,6 +2113,10 @@ class Store:
                    WHERE id=?""",
                 (now, now, delivery_id),
             )
+            # Stopping a delivery releases its held point unless an unresolved
+            # request may already have reached the receiver; then it is parked
+            # for customer reconciliation and the point stays reserved.
+            self._settle_stopped_delivery(conn, delivery_id=delivery_id, now=now)
             conn.execute(
                 """INSERT INTO admin_actions(id, delivery_id, action, reason, actor, created_at, target_version)
                    VALUES (?,?,?,?,?,?,?)""",
@@ -1672,7 +2193,7 @@ class Store:
         """
         with self._read() as conn:
             due = conn.execute(
-                """SELECT MIN(COALESCE(d.next_attempt_at, ?)) AS t FROM deliveries d
+                f"""SELECT MIN(COALESCE(d.next_attempt_at, ?)) AS t FROM deliveries d
                    WHERE d.status IN ('pending','retry_wait')
                      AND NOT EXISTS (
                          SELECT 1 FROM deliveries p
@@ -1680,14 +2201,27 @@ class Store:
                            AND p.flow_id = d.flow_id
                            AND p.seq < d.seq
                            AND p.status NOT IN ('succeeded','administratively_skipped','withdrawn')
-                     )""",
-                (now,),
+                     )
+                     AND {self._supply_predicate('?')}""",
+                (now, now),
             ).fetchone()
             leases = conn.execute(
                 "SELECT MIN(lease_until) AS t FROM deliveries WHERE status='in_progress'"
             ).fetchone()
         candidates = [t for t in (due["t"], leases["t"]) if t is not None]
         return min(candidates) if candidates else None
+
+    def sellable_point(self, *, customer_id: str, now: float) -> bool:
+        """Whether the customer currently has a point that could be allocated."""
+        with self._read() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM credit_topups ct WHERE ct.customer_id=? AND ct.expires_at > ?
+                   AND (ct.points - COALESCE((SELECT SUM(ca.points) FROM credit_allocations ca
+                        WHERE ca.topup_id=ct.id AND ca.stage IN ('held','charged','expired')),0)) > 0
+                   LIMIT 1""",
+                (customer_id, now),
+            ).fetchone()
+        return row is not None
 
     # ------------------------------------------------------------- read side
     def get_delivery(self, delivery_id: str) -> dict[str, Any]:
@@ -1718,6 +2252,13 @@ class Store:
                 "SELECT * FROM late_results WHERE delivery_id=? ORDER BY recorded_at",
                 (delivery_id,),
             ).fetchall()
+            alloc = conn.execute(
+                """SELECT a.id, a.stage, a.points, a.created_at, a.settled_at,
+                          t.topup_ref AS topup_ref
+                   FROM credit_allocations a LEFT JOIN credit_topups t ON t.id = a.topup_id
+                   WHERE a.delivery_id=? ORDER BY a.created_at DESC LIMIT 1""",
+                (delivery_id,),
+            ).fetchone()
         blocking = [p for p in predecessors if p["status"] not in TERMINAL_STATUSES]
         event_withdrawn = self._is_withdrawn_row(event) if event is not None else True
         if event is None or event_withdrawn:
@@ -1761,6 +2302,23 @@ class Store:
             "block_reason": self._describe_block(row, blocking),
             "blocking_delivery_ids": [p["id"] for p in blocking],
             "last_error": row["last_error"],
+            "billable": bool(row["billable"]),
+            "credit_stage": row["credit_stage"],
+            "credit": {
+                "allocation_id": alloc["id"] if alloc is not None else None,
+                "topup_ref": alloc["topup_ref"] if alloc is not None else None,
+                "stage": alloc["stage"] if alloc is not None else None,
+                "points": int(alloc["points"]) if alloc is not None else 0,
+                "allocated_at": iso_time(alloc["created_at"]) if alloc is not None else None,
+                "settled_at": iso_time(alloc["settled_at"]) if alloc is not None else None,
+            },
+            "reconciliation": {
+                "pending": row["credit_stage"] == "reconciliation",
+                "reason": row["reconciliation_reason"],
+                "state": row["reconciliation_state"],
+                "note": row["reconciliation_note"],
+                "confirmed_at": iso_time(row["reconciliation_at"]),
+            },
             "created_at": iso_time(row["created_at"]),
             "updated_at": iso_time(row["updated_at"]),
             "completed_at": iso_time(row["completed_at"]),
