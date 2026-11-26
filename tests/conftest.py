@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
+from webhook_delivery.api import create_app
 from webhook_delivery.config import FakeClock, Settings
 from webhook_delivery.store import Store
 from tests.helpers import ScriptedSender
@@ -24,6 +26,14 @@ def store(settings) -> Store:
     store = Store(settings)
     store.initialize()
     return store
+
+
+@pytest.fixture()
+def client(settings, store, clock):
+    """FastAPI TestClient sharing the same settings/store/clock fixtures."""
+    app = create_app(settings=settings, store=store, clock=clock)
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture()

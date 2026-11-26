@@ -162,6 +162,17 @@ class Worker:
 
     # -------------------------------------------------------------- one unit
     def attempt(self, claim: ClaimedDelivery) -> str:
+        # Withdrawal fence: the claim happened earlier (possibly in another
+        # process/iteration).  This write transaction is serialised against
+        # topic withdrawal; if withdrawal won, no HTTP request may be sent.
+        # Stores without the gate (test doubles) keep the old behaviour.
+        gate = getattr(self.store, "mark_sending", None)
+        if callable(gate) and not gate(claim, now=self.clock.now()):
+            log.info(
+                "delivery=%s skipped at send gate (topic withdrawn or lease lost)",
+                claim.id,
+            )
+            return "not_sent"
         result = self.sender.send(claim, self.policy.settings.request_timeout_seconds)
         retry_delay = None
         if result.outcome != "succeeded":

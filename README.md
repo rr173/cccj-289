@@ -18,21 +18,25 @@ Everything is in `webhook_delivery/`:
 
 | file | role |
 |---|---|
-| `api.py` | FastAPI app: customers, subscriptions, event ingestion, read models, admin retry/skip |
-| `store.py` | All state transitions, the only place that writes SQL; optimistic concurrency rules live here |
-| `worker.py` | Standalone delivery process (`python -m webhook_delivery.worker`), leases, retries |
+| `api.py` | FastAPI app: customers, subscriptions, event ingestion, topic withdrawal, tickets/evidence, read models, admin retry/skip |
+| `store.py` | All state transitions, the only place that writes SQL; optimistic concurrency, withdrawal and retention rules live here |
+| `worker.py` | Standalone delivery process (`python -m webhook_delivery.worker`), leases, send gate, retries |
+| `cli.py` / `__main__.py` | `python -m webhook_delivery …` operations CLI for existing databases (withdraw / tickets / evidence) |
 | `config.py` | `Settings` (back-offs, timeouts, lease, max attempts) and `Clock` / `FakeClock` |
 | `receiver.py` | Controllable `http.server` receiver used by the demo and tests |
 | `util.py` | IDs, canonical JSON, content hashing, URL validation, errors |
 
-`demo.py` is the independent end-to-end demo; `tests/` holds the deterministic
-suite (43 tests, ~8 s, no real waiting).
+`demo.py` is the delivery end-to-end demo; `demo_retraction.py` is the
+topic-withdrawal / ticket-retention demo (`./run_retraction_demo.sh`).
+`tests/` holds the deterministic suite (80 tests, ~20 s including real-socket
+and thread-contention cases, no long waits).
 
 ## Run it
 
 ```bash
-./run_demo.sh     # installs deps into ./.pylibs on first run, then runs the demo
-./run_tests.sh    # same bootstrap, then pytest
+./run_demo.sh              # installs deps into ./.pylibs on first run, then runs the delivery demo
+./run_retraction_demo.sh   # self-checking topic-withdrawal/evidence demo
+./run_tests.sh             # same bootstrap, then pytest
 ```
 
 `run_demo.sh` starts an API subprocess, several worker subprocesses, and two
@@ -46,8 +50,19 @@ local receivers; it prints each assertion as it is verified.
 | `POST` | `/subscriptions` | `{customer_id, target_url}` → subscription; only events accepted **after** creation fan out to it |
 | `GET` | `/subscriptions/{id}` | includes current `target_url` and `target_version` |
 | `PATCH` | `/subscriptions/{id}` | `{customer_id, target_url, expected_target_version?}`; bumps `target_version` |
-| `POST` | `/events` | `{customer_id, flow_id, caller_event_id, payload}`; returns the event, its per-flow `seq`, and one delivery per subscription |
-| `GET` | `/events?customer_id&flow_id` | event log |
+| `POST` | `/events` | `{customer_id, flow_id, caller_event_id, payload, topic_id?}`; returns the event, its per-flow `seq`, and one delivery per subscription |
+| `GET` | `/events?customer_id&flow_id&topic_id` | event log; withdrawn topics return tombstones (`payload`/`content_hash` are `null`) |
+| `GET` | `/events/{event_id}` | one event read model (content-safe after withdrawal) |
+| `POST` | `/topics/{topic_id}/withdraw` | `{customer_id}` (or `?customer_id=`); idempotent irreversible withdrawal; `{"wait_for_inflight": true}` optionally waits for this topic's in-flight sends |
+| `POST` | `/topics/withdraw` · `POST /withdrawals` · `DELETE /topics/{topic_id}` | aliases for the same operation |
+| `GET` | `/topics?customer_id=` · `GET /topics/{topic_id}?customer_id=` | topic status |
+| `POST` | `/tickets` | `{customer_id, title?, reason?}` → investigation ticket (`201`) |
+| `GET` | `/tickets?customer_id=` · `GET /tickets/{id}` | ticket metadata incl. retained event ids and (open only) evidence |
+| `POST` | `/tickets/{id}/events` | `{event_id}` or `{event_ids:[…]}`; retains received, non-withdrawn events (idempotent) |
+| `GET` | `/tickets/{id}/events` | preserved evidence with original `payload`/hash; `409 ticket_closed` after closure |
+| `POST` | `/tickets/{id}/close` | closes the ticket and purges its private evidence copy |
+| `POST` | `/events/{event_id}/retain` · `POST /retentions` | retain from the event side / create-and-retain in one call |
+| `GET/POST` | `/cases…`, `/holds…`, `/work-orders…` | vocabulary aliases for the ticket endpoints (`…/evidence`, `…/retain`, `…/close`) |
 | `GET` | `/subscriptions/{id}/deliveries` | per-delivery status, target version, blocking reason |
 | `GET` | `/deliveries/{delivery_id}` | full detail: every attempt with its target URL/version, admin actions, late results |
 | `POST` | `/deliveries/{delivery_id}/retry` | `{reason, actor}`; only for `needs_attention` |
@@ -55,7 +70,103 @@ local receivers; it prints each assertion as it is verified.
 
 Errors are `{"error": {"code", "message"}}` with codes such as
 `caller_event_conflict` (409), `invalid_target_url` (400),
-`target_version_conflict` (409), `invalid_state` (409), `reason_required` (422).
+`target_version_conflict` (409), `invalid_state` (409), `reason_required` (422),
+`topic_withdrawn` / `event_withdrawn` / `ticket_closed` /
+`delivery_withdrawn` (409), `ticket_not_found` / `event_not_found` (404).
+
+## Topic withdrawal & ticket evidence retention
+
+A customer can tag an event at ingestion with one customer-scoped
+`topic_id` (at most one). Events without a topic — including every event
+already in a database created by an older version — behave exactly as before.
+
+**Tickets ("工单").** `POST /tickets` opens an investigation ticket.
+Retaining an event (`POST /tickets/{id}/events`) copies its content into the
+ticket inside the same kind of `BEGIN IMMEDIATE` transaction used everywhere
+else. Retention only succeeds for events of the same customer that are
+received and not yet withdrawn. The same event can be retained by any number
+of tickets independently. An open ticket reads its copies via
+`GET /tickets/{id}/events`. Closing (`POST /tickets/{id}/close`) rejects all
+further reads and additions and purges that ticket's copies.
+
+**Withdrawal.** `POST /topics/{topic_id}/withdraw` is irreversible and safe
+to repeat (`already_withdrawn: true` on repeats). The committing transaction:
+
+* replaces `events.payload_json` with a JSON `null` sentinel and clears
+  `content_hash`, and marks the rows `status='withdrawn'` — `GET /events`
+  and delivery/event read models then expose only id, flow, `seq`, timestamps
+  and the `withdrawn` flag, never the JSON or its digest;
+* keeps the `(customer, flow, caller_event_id)` tombstone, so reposting the
+  original key is rejected (`event_withdrawn`/`topic_withdrawn`) — identical
+  resend cannot restore content or allocations, and changed content cannot
+  reuse the key;
+* rejects every new event carrying that `topic_id` **before** sequence
+  allocation or fan-out, so rejected events leave no seq gap and no
+  delivery;
+* turns every delivery not already `succeeded` or
+  `administratively_skipped` into the terminal status `withdrawn`. Confirmed
+  successes and admin-skipped facts (status, attempts, reasons/actions) are
+  preserved. Withdrawn work is never claimed/retried, is not revived by a
+  target change or admin retry, and counts as terminal for per-flow ordering,
+  so the next non-withdrawn event in the same flow is unblocked;
+* clears free-text diagnostic columns that may carry a receiver echo
+  (`deliveries.last_error`, `attempts.error`, `late_results.error`).
+
+**Send fence and late results.** A worker transitions a claim through
+`Store.mark_sending()` (a write transaction) immediately before invoking the
+HTTP sender. Because both that transition and withdrawal are
+`BEGIN IMMEDIATE` writers, their server-side commit order decides the race:
+
+* withdrawal first → the fence fails and **no HTTP request is sent** for the
+  claimed-but-unsent unit;
+* fence first → the request is already in flight. Withdrawal may optionally
+  wait for such attempts (`wait_for_inflight=true` / CLI `--wait`, bounded by
+  `--wait-timeout`) but other topics are never held up. When the late reply
+  lands, `finish_attempt` sees `status='withdrawn'` first: the delivery is
+  never rewritten, and the sender's error text (which can contain a receiver
+  echo of the payload) is deliberately not persisted.
+
+**Retention vs withdrawal** is likewise decided by commit order: a retention
+that commits first has its own content copy and stays readable while the
+ticket is open; a withdrawal that commits first makes retention fail with
+`event_withdrawn`. When the last open ticket's copy is purged by closure, no
+original content remains in SQL-visible tables (verified by a full-table scan
+in `tests/test_retraction.py`). A best-effort `PRAGMA wal_checkpoint(TRUNCATE)`
+limits recent WAL frames; external receivers, historical backups and
+disk-page forensics are deliberately out of scope.
+
+**Multiple processes / restart.** All of the above is only database state, so
+the API process, several worker processes and the CLI can share one SQLite
+file exactly as before; a fresh `Store` after restart observes the same
+withdrawals, tickets and fences. Expired leases belonging to withdrawn
+deliveries are settled as `expired` attempts but never re-queued.
+
+### Using it on an existing database — no backfill
+
+`Store.initialize()` (run by the API lifespan, the worker and every CLI
+command) performs an additive migration: it adds `events.topic_id`,
+`events.status` and `attempts.send_started_at` if missing and creates the
+`topics`, `tickets` and `ticket_evidence` tables. Existing rows get
+`topic_id = NULL` and keep working unchanged; there is nothing to backfill.
+
+```bash
+# 1. update the code, then simply start the API/worker as usual — migration runs once
+WEBHOOK_DB=/var/lib/webhook/webhook_delivery.db \
+  uvicorn webhook_delivery.api:app --host 127.0.0.1 --port 8000
+python -m webhook_delivery.worker --db /var/lib/webhook/webhook_delivery.db
+
+# 2. or operate directly on the existing file with the CLI
+export PYTHONPATH="$PWD/.pylibs:$PWD"
+python -m webhook_delivery --db /var/lib/webhook/webhook_delivery.db init-db
+python -m webhook_delivery --db … withdraw-topic --customer cus_acme --topic gdpr-42
+python -m webhook_delivery --db … create-ticket --customer cus_acme --title "case 4821"
+python -m webhook_delivery --db … retain --ticket tkt_… --event evt_… [--event evt_…]
+python -m webhook_delivery --db … list-evidence --ticket tkt_…
+python -m webhook_delivery --db … close-ticket --ticket tkt_…
+```
+
+`./run_retraction_demo.sh` runs a self-checking local demo of the ticket,
+erasure, ordering and receiver-echo scenarios on a throw-away database.
 
 ## Semantics as implemented
 
