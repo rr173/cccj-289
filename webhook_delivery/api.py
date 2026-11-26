@@ -32,12 +32,25 @@ class CustomerIn(BaseModel):
 class SubscriptionIn(BaseModel):
     customer_id: str = Field(min_length=1, max_length=200)
     target_url: str = Field(min_length=1, max_length=2000)
+    # Optional participating erasure receiver.  When present the subscription's
+    # topic-bearing callbacks are directed at that receiver's registered URL.
+    erasure_receiver_id: str | None = Field(default=None, max_length=200)
 
 
 class SubscriptionPatch(BaseModel):
     customer_id: str = Field(min_length=1, max_length=200)
     target_url: str = Field(min_length=1, max_length=2000)
     expected_target_version: int | None = None
+    erasure_receiver_id: str | None = Field(default=None, max_length=200)
+    # Explicitly switch the subscription to an ordinary (non-participating)
+    # target.  Only one of erasure_receiver_id / clear_erasure_receiver should
+    # be used at a time.
+    clear_erasure_receiver: bool = False
+
+
+class ErasureReceiverIn(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=200)
+    url: str = Field(min_length=1, max_length=2000)
 
 
 class EventIn(BaseModel):
@@ -104,6 +117,7 @@ class SubscriptionOut(BaseModel):
     target_url: str
     target_version: int
     ordinal: int
+    erasure_receiver_id: str | None = None
     created_at: str | None
     updated_at: str | None
 
@@ -263,7 +277,12 @@ def create_app(
     # -------------------------------------------------------- subscriptions
     @app.post("/subscriptions", status_code=201, response_model=SubscriptionOut)
     def create_subscription(body: SubscriptionIn) -> dict[str, Any]:
-        return store.create_subscription(customer_id=body.customer_id, target_url=body.target_url, now=now())
+        return store.create_subscription(
+            customer_id=body.customer_id,
+            target_url=body.target_url,
+            now=now(),
+            erasure_receiver_id=body.erasure_receiver_id,
+        )
 
     @app.get("/subscriptions/{subscription_id}", response_model=SubscriptionOut)
     def get_subscription(subscription_id: str) -> dict[str, Any]:
@@ -280,6 +299,44 @@ def create_app(
             target_url=body.target_url,
             now=now(),
             expected_version=body.expected_target_version,
+            erasure_receiver_id=body.erasure_receiver_id,
+            clear_erasure_receiver=body.clear_erasure_receiver,
+        )
+
+    # ------------------------------------------------ erasure receiver peers
+    @app.post("/erasure-receivers", status_code=201, response_model=dict)
+    def register_erasure_receiver(body: ErasureReceiverIn) -> dict[str, Any]:
+        return store.register_erasure_receiver(
+            customer_id=body.customer_id, url=body.url, now=now()
+        )
+
+    @app.get("/erasure-receivers", response_model=list[dict])
+    def list_erasure_receivers(customer_id: str | None = None) -> list[dict[str, Any]]:
+        return store.list_erasure_receivers(customer_id=customer_id)
+
+    @app.get("/erasure-receivers/{receiver_id}", response_model=dict)
+    def get_erasure_receiver(receiver_id: str) -> dict[str, Any]:
+        return store.get_erasure_receiver(receiver_id)
+
+    # --------------------------------------------------- erasure progress
+    @app.get("/topics/{topic_id}/erasure")
+    def get_topic_erasure(topic_id: str, customer_id: str) -> dict[str, Any]:
+        return store.get_topic_erasure(customer_id=customer_id, topic_id=topic_id)
+
+    @app.get("/erasure-requests")
+    def list_erasure_requests(
+        customer_id: str | None = None, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        return store.list_erasure_requests(customer_id=customer_id, status=status, limit=limit)
+
+    @app.get("/erasure-requests/{erasure_id}")
+    def get_erasure_request(erasure_id: str) -> dict[str, Any]:
+        return store.get_erasure_request(erasure_id)
+
+    @app.post("/erasure-requests/{erasure_id}/retry")
+    def retry_erasure(erasure_id: str, body: AdminActionIn) -> dict[str, Any]:
+        return store.retry_erasure(
+            erasure_id, now=now(), reason=body.reason, actor=body.actor
         )
 
     # --------------------------------------------------------------- events

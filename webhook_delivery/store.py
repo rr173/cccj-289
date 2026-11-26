@@ -30,6 +30,11 @@ Key invariants encoded here
 * A ticket copies evidence content at retain time.  Retention after
   withdrawal is impossible; closing a ticket purges its copies, so once no
   open ticket holds an event no original content remains in normal tables.
+* External replica erasure is scoped to the receivers the worker was actually
+  authorized to send to: the obligation is written in ``begin_send`` (the send
+  fence) before any request, never removed, and turned into one durable erasure
+  request per receiver inside the withdrawal transaction.  Only a receiver's
+  own acknowledgement of that exact operation id confirms it.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Iterator
 
 from .config import Settings
@@ -76,6 +81,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     target_url     TEXT NOT NULL,
     target_version INTEGER NOT NULL DEFAULT 1,
     ordinal        INTEGER NOT NULL,
+    -- Optional participating erasure receiver for topic-bearing callbacks.
+    -- NULL means "ordinary target": no erasure cooperation, original behaviour.
+    erasure_receiver_id TEXT,
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL
 );
@@ -88,6 +96,79 @@ CREATE TABLE IF NOT EXISTS topics (
     withdrawn_at REAL,
     PRIMARY KEY (customer_id, topic_id)
 );
+
+-- A customer-registered receiver that participates in the external-replica
+-- erasure protocol.  The registration id is stable and its URL is fixed:
+-- changing a subscription's target never moves an erasure obligation from the
+-- receiver that was actually authorized to receive a topic callback.
+CREATE TABLE IF NOT EXISTS erasure_receivers (
+    id          TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL REFERENCES customers(id),
+    url         TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_erasure_receivers_customer
+    ON erasure_receivers(customer_id, created_at);
+
+-- One row per (customer, topic, receiver) the worker was ever *authorized* to
+-- send to.  The obligation is written in the same transaction as the send
+-- fence, before any HTTP request, and is never removed: a failed, timed-out,
+-- superseded or still-in-flight callback still leaves a remote replica behind.
+-- Its existence is what includes the receiver in the topic's erasure scope; a
+-- receiver that was only configured (or only selected after withdrawal) and
+-- never actually authorized for this topic has no row and is not notified.
+CREATE TABLE IF NOT EXISTS erasure_obligations (
+    customer_id         TEXT NOT NULL,
+    topic_id            TEXT NOT NULL,
+    receiver_id         TEXT NOT NULL,
+    first_authorized_at REAL NOT NULL,
+    last_authorized_at  REAL NOT NULL,
+    -- Highest authorization sequence ever issued to this receiver for this
+    -- topic.  Sent in each callback and becomes the erasure request's seal
+    -- watermark, so a callback that was authorized before withdrawal is
+    -- rejected by the receiver even if its HTTP request arrives after the
+    -- erasure request.
+    max_auth_seq        INTEGER NOT NULL DEFAULT 0,
+    authorization_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (customer_id, topic_id, receiver_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_erasure_obligations_topic
+    ON erasure_obligations(customer_id, topic_id);
+
+-- Durable erasure work.  ``id`` is the stable operation number reused by every
+-- retry (and therefore the only id a receiver may acknowledge).  Rows are
+-- created inside the withdrawal transaction, so a crash right after the local
+-- withdrawal still leaves every required remote erasure discoverable.
+CREATE TABLE IF NOT EXISTS erasure_requests (
+    id              TEXT PRIMARY KEY,
+    customer_id     TEXT NOT NULL,
+    topic_id        TEXT NOT NULL,
+    receiver_id     TEXT NOT NULL,
+    receiver_url    TEXT NOT NULL,
+    -- Highest callback authorization sequence for this (customer, topic,
+    -- receiver) at withdrawal time.  The receiver seals against it: no
+    -- callback authorized at or below this number may (re)create a replica,
+    -- regardless of whether its HTTP request beat or followed this one.
+    watermark       INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts_count  INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL,
+    lease_token     TEXT,
+    lease_until     REAL,
+    last_error      TEXT,
+    last_http_status INTEGER,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    acknowledged_at REAL,
+    UNIQUE (customer_id, topic_id, receiver_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_erasure_requests_due
+    ON erasure_requests(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS ix_erasure_requests_topic
+    ON erasure_requests(customer_id, topic_id);
 
 CREATE TABLE IF NOT EXISTS events (
     id              TEXT PRIMARY KEY,
@@ -117,6 +198,10 @@ CREATE TABLE IF NOT EXISTS deliveries (
     seq             INTEGER NOT NULL,
     target_url      TEXT NOT NULL,
     target_version  INTEGER NOT NULL,
+    -- Snapshot of the participating erasure receiver this delivery is directed
+    -- at (NULL for an ordinary target).  A target change repoints pending work
+    -- but never moves an obligation already recorded for another receiver.
+    erasure_receiver_id TEXT,
     status          TEXT NOT NULL,
     -- 1 when this delivery needs one prepaid point (billable event).
     billable        INTEGER NOT NULL DEFAULT 0,
@@ -297,10 +382,31 @@ ERASED_HASH = ""
 ERASED_PAYLOAD = "null"
 WITHDRAWN_REASON = "topic_withdrawn"
 REDACTED_TEXT = "error detail removed when the topic was withdrawn"
+# Remote erasure request lifecycle.
+ERASURE_PENDING = "pending"
+ERASURE_IN_PROGRESS = "in_progress"
+ERASURE_ACKNOWLEDGED = "acknowledged"
+# Outcome an erasure worker records for one attempt.
+ERASURE_ATTEMPT_ACK = "acknowledged"
+ERASURE_ATTEMPT_FAILED = "failed"
 # Reconciliation states a customer may record for a stopped, unresolved delivery.
 RECONCILED_RECEIVED = "received"
 RECONCILED_NOT_RECEIVED = "not_received"
 
+
+
+@dataclass(frozen=True)
+class ClaimedErasure:
+    """A lease-backed remote erasure request handed to one erasure worker."""
+
+    id: str
+    customer_id: str
+    topic_id: str
+    receiver_id: str
+    receiver_url: str
+    watermark: int
+    attempts_count: int
+    lease_token: str
 
 
 @dataclass(frozen=True)
@@ -323,6 +429,15 @@ class ClaimedDelivery:
     payload_json: str
     event_created_at: float
     billable: bool = False
+    # Non-NULL only for a topic-bearing callback aimed at a participating
+    # erasure receiver.  Such a delivery must carry the receiver registration
+    # id, customer and topic id, and the original delivery id.
+    erasure_receiver_id: str | None = None
+    topic_id: str | None = None
+    # Authorization sequence for a topic callback to a participating receiver;
+    # stamped at the send gate and sent in the request so the receiver can
+    # seal against post-withdrawal recreation.  0 = not an erasure callback.
+    auth_seq: int = 0
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -356,6 +471,14 @@ class Store:
             )
             self._add_column_if_missing(
                 conn, "attempts", "send_started_at", "send_started_at REAL"
+            )
+            # ---- external replica erasure (additive; old rows behave as
+            # ordinary, non-participating targets) ----
+            self._add_column_if_missing(
+                conn, "subscriptions", "erasure_receiver_id", "erasure_receiver_id TEXT"
+            )
+            self._add_column_if_missing(
+                conn, "deliveries", "erasure_receiver_id", "erasure_receiver_id TEXT"
             )
             # ---- prepaid credits (additive; old rows are non-billable) ----
             self._add_column_if_missing(
@@ -521,25 +644,147 @@ class Store:
         if conn.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone() is None:
             raise DomainError("unknown customer_id", status_code=404, code="customer_not_found")
 
+    # ------------------------------------------------- external erasure peers
+    def register_erasure_receiver(
+        self, *, customer_id: str, url: str, now: float
+    ) -> dict[str, Any]:
+        """Register one participating erasure receiver for a customer.
+
+        The registration id is the customer's handle for this fixed HTTP
+        address.  Only the customer's own subscriptions may select it as their
+        target, and an existing id is never reused for a different URL.
+        """
+        if not self.customer_exists(customer_id):
+            raise DomainError("unknown customer_id", status_code=404, code="customer_not_found")
+        url = validate_target_url(url)
+        receiver_id = new_id("erc")
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO erasure_receivers(id, customer_id, url, created_at) VALUES (?,?,?,?)",
+                (receiver_id, customer_id, url, now),
+            )
+        return self.get_erasure_receiver(receiver_id)
+
+    def get_erasure_receiver(self, receiver_id: str) -> dict[str, Any]:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT * FROM erasure_receivers WHERE id=?", (receiver_id,)
+            ).fetchone()
+        if row is None:
+            raise DomainError(
+                "erasure receiver not found", status_code=404, code="erasure_receiver_not_found"
+            )
+        return {
+            "id": row["id"],
+            "receiver_id": row["id"],
+            "customer_id": row["customer_id"],
+            "url": row["url"],
+            "created_at": iso_time(row["created_at"]),
+        }
+
+    def list_erasure_receivers(self, *, customer_id: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if customer_id:
+            clauses.append("customer_id=?")
+            params.append(customer_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._read() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM erasure_receivers{where} ORDER BY created_at, id", params
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "receiver_id": r["id"],
+                "customer_id": r["customer_id"],
+                "url": r["url"],
+                "created_at": iso_time(r["created_at"]),
+            }
+            for r in rows
+        ]
+
+    def _resolve_erasure_receiver(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        customer_id: str,
+        erasure_receiver_id: str | None,
+        target_url: str,
+    ) -> tuple[str | None, str]:
+        """Validate an optional erasure target and return (receiver_id, url).
+
+        Selecting a participating receiver pins the HTTP address to that
+        registration (the caller's target_url is only advisory, so a stale
+        client cannot send a topic callback someplace the registration does
+        not cover).  Omitting it keeps the ordinary, unmodified behaviour.
+        """
+        if erasure_receiver_id is None:
+            return None, target_url
+        if not isinstance(erasure_receiver_id, str) or not erasure_receiver_id.strip():
+            raise DomainError(
+                "erasure_receiver_id must be a non-empty string",
+                status_code=422,
+                code="invalid_request",
+            )
+        receiver_id = erasure_receiver_id.strip()
+        row = conn.execute(
+            "SELECT * FROM erasure_receivers WHERE id=?", (receiver_id,)
+        ).fetchone()
+        if row is None:
+            raise DomainError(
+                "erasure receiver not found", status_code=404, code="erasure_receiver_not_found"
+            )
+        if row["customer_id"] != customer_id:
+            raise DomainError(
+                "erasure receiver belongs to a different customer",
+                status_code=403,
+                code="forbidden",
+            )
+        return receiver_id, row["url"]
+
     # ---------------------------------------------------------- subscriptions
-    def create_subscription(self, *, customer_id: str, target_url: str, now: float) -> dict[str, Any]:
+    def create_subscription(
+        self,
+        *,
+        customer_id: str,
+        target_url: str,
+        now: float,
+        erasure_receiver_id: str | None = None,
+    ) -> dict[str, Any]:
         if not self.customer_exists(customer_id):
             raise DomainError("unknown customer_id", status_code=404, code="customer_not_found")
         target_url = validate_target_url(target_url)
         subscription_id = new_id("sub")
         with self._write() as conn:
+            erasure_receiver_id, resolved_url = self._resolve_erasure_receiver(
+                conn,
+                customer_id=customer_id,
+                erasure_receiver_id=erasure_receiver_id,
+                target_url=target_url,
+            )
+            target_url = resolved_url
             ordinal = self._next_ordinal(conn)
             conn.execute(
                 """INSERT INTO subscriptions(id, customer_id, target_url, target_version, ordinal,
-                                             created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (subscription_id, customer_id, target_url, 1, ordinal, now, now),
+                                             erasure_receiver_id, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    subscription_id,
+                    customer_id,
+                    target_url,
+                    1,
+                    ordinal,
+                    erasure_receiver_id,
+                    now,
+                    now,
+                ),
             )
             # Close the race where an event transaction committed just after
             # this subscription's clock reading but before this insert.
             # Withdrawn events are never fanned out to a new subscription.
             rows = conn.execute(
-                """SELECT id, flow_id, seq, billable FROM events
+                """SELECT id, flow_id, seq, billable, topic_id FROM events
                    WHERE customer_id=? AND ordinal > ? AND status != 'withdrawn'
                    ORDER BY ordinal""",
                 (customer_id, ordinal),
@@ -556,6 +801,11 @@ class Store:
                     target_version=1,
                     now=now,
                     billable=bool(row["billable"]),
+                    # Only topic-bearing events to a participating receiver are
+                    # in the erasure protocol; topic-less ones stay ordinary.
+                    erasure_receiver_id=(
+                        erasure_receiver_id if row["topic_id"] is not None else None
+                    ),
                 )
         return self.get_subscription(subscription_id)
 
@@ -570,6 +820,9 @@ class Store:
             "target_url": row["target_url"],
             "target_version": row["target_version"],
             "ordinal": row["ordinal"],
+            "erasure_receiver_id": row["erasure_receiver_id"]
+            if "erasure_receiver_id" in row.keys()
+            else None,
             "created_at": iso_time(row["created_at"]),
             "updated_at": iso_time(row["updated_at"]),
         }
@@ -581,6 +834,8 @@ class Store:
         target_url: str,
         now: float,
         expected_version: int | None = None,
+        erasure_receiver_id: str | None = None,
+        clear_erasure_receiver: bool = False,
     ) -> dict[str, Any]:
         target_url = validate_target_url(target_url)
         with self._write() as conn:
@@ -593,10 +848,21 @@ class Store:
                     status_code=409,
                     code="target_version_conflict",
                 )
+            customer_id = row["customer_id"]
+            erasure_receiver_id, target_url = self._resolve_erasure_receiver(
+                conn,
+                customer_id=customer_id,
+                erasure_receiver_id=erasure_receiver_id,
+                target_url=target_url,
+            )
+            if clear_erasure_receiver:
+                erasure_receiver_id = None
             new_version = int(row["target_version"]) + 1
             conn.execute(
-                "UPDATE subscriptions SET target_url=?, target_version=?, updated_at=? WHERE id=?",
-                (target_url, new_version, now, subscription_id),
+                """UPDATE subscriptions
+                   SET target_url=?, target_version=?, erasure_receiver_id=?, updated_at=?
+                   WHERE id=?""",
+                (target_url, new_version, erasure_receiver_id, now, subscription_id),
             )
             # Not-yet-succeeded work automatically moves to the new address the
             # next time it is claimed.  In-flight rows intentionally keep the
@@ -604,12 +870,20 @@ class Store:
             # stale and discarded.  needs_attention rows stay parked; an
             # administrator must still retry them.  Succeeded and withdrawn
             # rows are never touched (withdrawn work is never revived by an
-            # address change).
+            # address change).  Any erasure obligation already recorded for the
+            # previous receiver stays in ``erasure_obligations`` — repointing
+            # never transfers or cancels it.
             conn.execute(
                 """UPDATE deliveries
-                   SET target_url=?, target_version=?, updated_at=?
+                   SET target_url=?, target_version=?, erasure_receiver_id=?, updated_at=?
                    WHERE subscription_id=? AND status IN ('pending','retry_wait','needs_attention')""",
-                (target_url, new_version, now, subscription_id),
+                (
+                    target_url,
+                    new_version,
+                    erasure_receiver_id,
+                    now,
+                    subscription_id,
+                ),
             )
         return self.get_subscription(subscription_id)
 
@@ -718,7 +992,8 @@ class Store:
                 ),
             )
             subscriptions = conn.execute(
-                "SELECT id, target_url, target_version FROM subscriptions WHERE customer_id=? AND ordinal < ?",
+                """SELECT id, target_url, target_version, erasure_receiver_id
+                   FROM subscriptions WHERE customer_id=? AND ordinal < ?""",
                 (customer_id, ordinal),
             ).fetchall()
             for sub in subscriptions:
@@ -733,6 +1008,12 @@ class Store:
                     target_version=int(sub["target_version"]),
                     now=now,
                     billable=billable,
+                    # Only a topic-bearing callback to a participating receiver
+                    # is in the erasure protocol.  An ordinary target, or any
+                    # event without a topic, keeps the original behaviour.
+                    erasure_receiver_id=(
+                        sub["erasure_receiver_id"] if topic_id is not None else None
+                    ),
                 )
             stored = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
             return self._event_result(conn, stored, replayed=False)
@@ -808,6 +1089,7 @@ class Store:
         target_version: int,
         now: float,
         billable: bool = False,
+        erasure_receiver_id: str | None = None,
     ) -> None:
         prev = conn.execute(
             """SELECT id, status FROM deliveries
@@ -821,11 +1103,12 @@ class Store:
         credit_stage = "needed" if billable else "none"
         conn.execute(
             """INSERT INTO deliveries(id, event_id, subscription_id, customer_id, flow_id, seq,
-                                      target_url, target_version, status, billable, credit_stage,
+                                      target_url, target_version, erasure_receiver_id,
+                                      status, billable, credit_stage,
                                       attempts_count,
                                       next_attempt_at, blocked_by, block_reason,
                                       created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, NULL, ?, ?, ?, ?)""",
+               VALUES (?,?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, NULL, ?, ?, ?, ?)""",
             (
                 new_id("dlv"),
                 event_id,
@@ -835,6 +1118,7 @@ class Store:
                 seq,
                 target_url,
                 target_version,
+                erasure_receiver_id,
                 1 if billable else 0,
                 credit_stage,
                 blocked_by,
@@ -892,6 +1176,48 @@ class Store:
                     "UPDATE topics SET status='withdrawn', withdrawn_at=? WHERE customer_id=? AND topic_id=?",
                     (now, customer_id, topic_id),
                 )
+
+            # ---- external replica erasure scope --------------------------
+            # Every participating receiver the worker was ever authorized to
+            # send this topic's callbacks to gets exactly one durable erasure
+            # request, created in this same transaction.  This is what makes
+            # the obligation crash-safe: if the service dies right after the
+            # local withdrawal commits, the pending requests are still here and
+            # a restarted erasure worker continues them.  Receivers that were
+            # only configured, or only selected after withdrawal, have no
+            # obligation row and are deliberately not notified.  A repeat
+            # withdrawal is idempotent (ON CONFLICT DO NOTHING keeps the same
+            # operation id and any progress already made).
+            obligation_rows = conn.execute(
+                """SELECT o.receiver_id AS receiver_id, r.url AS url,
+                          o.max_auth_seq AS max_auth_seq
+                   FROM erasure_obligations o
+                   JOIN erasure_receivers r ON r.id = o.receiver_id
+                   WHERE o.customer_id=? AND o.topic_id=?
+                   ORDER BY o.first_authorized_at, o.receiver_id""",
+                (customer_id, topic_id),
+            ).fetchall()
+            erasure_created = 0
+            for obligation in obligation_rows:
+                cur = conn.execute(
+                    """INSERT INTO erasure_requests
+                           (id, customer_id, topic_id, receiver_id, receiver_url,
+                            watermark, status, attempts_count, next_attempt_at,
+                            created_at, updated_at)
+                       VALUES (?,?,?,?,?,?, 'pending', 0, NULL, ?, ?)
+                       ON CONFLICT(customer_id, topic_id, receiver_id) DO NOTHING""",
+                    (
+                        new_id("ers"),
+                        customer_id,
+                        topic_id,
+                        obligation["receiver_id"],
+                        obligation["url"],
+                        int(obligation["max_auth_seq"]),
+                        now,
+                        now,
+                    ),
+                )
+                erasure_created += cur.rowcount or 0
 
             event_rows = conn.execute(
                 "SELECT id FROM events WHERE customer_id=? AND topic_id=?",
@@ -1060,7 +1386,11 @@ class Store:
                 "credits_expired": credit_expired,
                 "open_holds_at_withdrawal": int(held["c"] or 0),
                 "waited_for_inflight": bool(wait_for_inflight and inflight_marked),
+                "erasure_requests_created": erasure_created,
             }
+        )
+        result["erasure"] = self.get_topic_erasure(
+            customer_id=customer_id, topic_id=topic_id
         )
         return result
 
@@ -1107,7 +1437,272 @@ class Store:
             "events": int(events),
         }
 
-    def list_topics(self, *, customer_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    # ---------------------------------------------- external erasure progress
+    def get_topic_erasure(
+        self, *, customer_id: str, topic_id: str
+    ) -> dict[str, Any]:
+        """Confirmation progress for one withdrawal's remote erasures.
+
+        Only participants that were actually authorized to receive this
+        topic's callbacks appear.  A receiver counts as confirmed only when it
+        acknowledged this exact erasure operation id; nothing local stands in
+        for that acknowledgement.  Receivers outside the protocol are not part
+        of this view.
+        """
+        with self._read() as conn:
+            rows = conn.execute(
+                """SELECT * FROM erasure_requests
+                   WHERE customer_id=? AND topic_id=?
+                   ORDER BY created_at, receiver_id""",
+                (customer_id, topic_id),
+            ).fetchall()
+        receivers = [self._erasure_request_json(r) for r in rows]
+        pending = [r for r in receivers if r["status"] != ERASURE_ACKNOWLEDGED]
+        return {
+            "customer_id": customer_id,
+            "topic_id": topic_id,
+            "total": len(receivers),
+            "acknowledged": len(receivers) - len(pending),
+            "pending": len(pending),
+            "complete": len(pending) == 0,
+            "receivers": receivers,
+            "acknowledged_receiver_ids": [
+                r["receiver_id"] for r in receivers if r["status"] == ERASURE_ACKNOWLEDGED
+            ],
+            "pending_receiver_ids": [r["receiver_id"] for r in pending],
+        }
+
+    @staticmethod
+    def _erasure_request_json(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "erasure_id": row["id"],
+            "operation_id": row["id"],
+            "customer_id": row["customer_id"],
+            "topic_id": row["topic_id"],
+            "receiver_id": row["receiver_id"],
+            "receiver_url": row["receiver_url"],
+            "watermark": int(row["watermark"]),
+            "status": row["status"],
+            "acknowledged": row["status"] == ERASURE_ACKNOWLEDGED,
+            "attempts_count": int(row["attempts_count"]),
+            "next_attempt_at": iso_time(row["next_attempt_at"]),
+            "last_error": row["last_error"],
+            "last_http_status": row["last_http_status"],
+            "created_at": iso_time(row["created_at"]),
+            "updated_at": iso_time(row["updated_at"]),
+            "acknowledged_at": iso_time(row["acknowledged_at"]),
+        }
+
+    def get_erasure_request(self, erasure_id: str) -> dict[str, Any]:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT * FROM erasure_requests WHERE id=?", (erasure_id,)
+            ).fetchone()
+        if row is None:
+            raise DomainError(
+                "erasure request not found", status_code=404, code="erasure_not_found"
+            )
+        return self._erasure_request_json(row)
+
+    def list_erasure_requests(
+        self, *, customer_id: str | None = None, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if customer_id:
+            clauses.append("customer_id=?")
+            params.append(customer_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._read() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM erasure_requests{where} ORDER BY created_at, receiver_id LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._erasure_request_json(r) for r in rows]
+
+    def claim_due_erasures(
+        self, *, now: float, lease_seconds: float, limit: int = 8
+    ) -> list[ClaimedErasure]:
+        """Lease due erasure requests, independent of delivery work.
+
+        A slow or unreachable receiver therefore never blocks delivery of an
+        unrelated topic, and vice versa.
+        """
+        claimed: list[ClaimedErasure] = []
+        with self._write() as conn:
+            rows = conn.execute(
+                """SELECT * FROM erasure_requests
+                   WHERE status IN ('pending','retry_wait')
+                     AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                   ORDER BY created_at, receiver_id
+                   LIMIT ?""",
+                (now, limit * 8),
+            ).fetchall()
+            for row in rows:
+                if len(claimed) >= limit:
+                    break
+                if row["lease_token"] and row["lease_until"] and row["lease_until"] > now:
+                    continue
+                token = new_id("eleas")
+                attempts_count = int(row["attempts_count"]) + 1
+                cur = conn.execute(
+                    """UPDATE erasure_requests
+                       SET status='in_progress', lease_token=?, lease_until=?,
+                           attempts_count=?, updated_at=?
+                       WHERE id=? AND status IN ('pending','retry_wait')
+                         AND (lease_token IS NULL OR lease_until IS NULL OR lease_until <= ?)""",
+                    (token, now + lease_seconds, attempts_count, now, row["id"], now),
+                )
+                if cur.rowcount != 1:
+                    continue
+                claimed.append(
+                    ClaimedErasure(
+                        id=row["id"],
+                        customer_id=row["customer_id"],
+                        topic_id=row["topic_id"],
+                        receiver_id=row["receiver_id"],
+                        receiver_url=row["receiver_url"],
+                        watermark=int(row["watermark"]),
+                        attempts_count=attempts_count,
+                        lease_token=token,
+                    )
+                )
+        return claimed
+
+    def finish_erasure(
+        self,
+        claim: ClaimedErasure,
+        *,
+        acknowledged: bool,
+        http_status: int | None,
+        error: str | None,
+        now: float,
+        retry_delay: float | None,
+    ) -> str:
+        """Finalize one erasure attempt, guarded by its lease token.
+
+        Only a positive acknowledgement of this exact operation id marks the
+        request acknowledged.  Any failure/timeout stays pending (optionally
+        after a back-off) and is retried automatically with the *same*
+        operation id.  Returns ``acknowledged``, ``retry_wait``, ``failed``
+        (budget exhausted, still pending for a later retry) or ``lease_lost``.
+        """
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT * FROM erasure_requests WHERE id=?", (claim.id,)
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "erasure request not found", status_code=404, code="erasure_not_found"
+                )
+            if row["lease_token"] != claim.lease_token:
+                return "lease_lost"
+            if row["status"] == ERASURE_ACKNOWLEDGED:
+                return "acknowledged"
+            if acknowledged:
+                conn.execute(
+                    """UPDATE erasure_requests
+                       SET status='acknowledged', last_error=NULL, last_http_status=?,
+                           lease_token=NULL, lease_until=NULL, next_attempt_at=NULL,
+                           acknowledged_at=?, updated_at=?
+                       WHERE id=? AND lease_token=?""",
+                    (http_status, now, now, claim.id, claim.lease_token),
+                )
+                return ERASURE_ACKNOWLEDGED
+            message = _describe_failure("erasure", http_status, error)
+            if retry_delay is None:
+                # Budget exhausted for automatic retries: park it as pending
+                # without a due time so it stays visible and can be retried by
+                # an operator, but does not spin.  Never acknowledged.
+                conn.execute(
+                    """UPDATE erasure_requests
+                       SET status='failed', last_error=?, last_http_status=?,
+                           lease_token=NULL, lease_until=NULL, next_attempt_at=NULL,
+                           updated_at=?
+                       WHERE id=? AND lease_token=?""",
+                    (message, http_status, now, claim.id, claim.lease_token),
+                )
+                return "failed"
+            conn.execute(
+                """UPDATE erasure_requests
+                   SET status='retry_wait', last_error=?, last_http_status=?,
+                       lease_token=NULL, lease_until=NULL, next_attempt_at=?,
+                       updated_at=?
+                   WHERE id=? AND lease_token=?""",
+                (message, http_status, now + retry_delay, now, claim.id, claim.lease_token),
+            )
+            return "retry_wait"
+
+    def recover_expired_erasure_leases(self, *, now: float) -> int:
+        """Re-queue erasure attempts whose lease expired without a result."""
+        with self._write() as conn:
+            rows = conn.execute(
+                """SELECT id FROM erasure_requests
+                   WHERE status='in_progress' AND lease_until IS NOT NULL AND lease_until <= ?""",
+                (now,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    """UPDATE erasure_requests
+                       SET status='pending', lease_token=NULL, lease_until=NULL,
+                           next_attempt_at=NULL,
+                           last_error='lease expired before a result was recorded',
+                           updated_at=?
+                       WHERE status='in_progress' AND lease_until IS NOT NULL AND lease_until <= ?""",
+                    (now, now),
+                )
+            return len(rows)
+
+    def retry_erasure(self, erasure_id: str, *, now: float, reason: str, actor: str) -> dict[str, Any]:
+        """Operator retry of a parked erasure request (same operation id)."""
+        reason = (reason or "").strip()
+        if not reason:
+            raise DomainError(
+                "a reason is required to retry an erasure request",
+                status_code=422,
+                code="reason_required",
+            )
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT * FROM erasure_requests WHERE id=?", (erasure_id,)
+            ).fetchone()
+            if row is None:
+                raise DomainError(
+                    "erasure request not found", status_code=404, code="erasure_not_found"
+                )
+            if row["status"] == ERASURE_ACKNOWLEDGED:
+                raise DomainError(
+                    "erasure request is already acknowledged",
+                    status_code=409,
+                    code="invalid_state",
+                )
+            conn.execute(
+                """UPDATE erasure_requests
+                   SET status='pending', attempts_count=0, next_attempt_at=NULL,
+                       lease_token=NULL, lease_until=NULL, updated_at=?
+                   WHERE id=?""",
+                (now, erasure_id),
+            )
+        return self.get_erasure_request(erasure_id)
+
+    def next_erasure_wakeup(self, *, now: float) -> float | None:
+        with self._read() as conn:
+            due = conn.execute(
+                """SELECT MIN(COALESCE(next_attempt_at, ?)) AS t FROM erasure_requests
+                   WHERE status IN ('pending','retry_wait')""",
+                (now,),
+            ).fetchone()
+            leases = conn.execute(
+                "SELECT MIN(lease_until) AS t FROM erasure_requests WHERE status='in_progress'"
+            ).fetchone()
+        candidates = [t for t in (due["t"], leases["t"]) if t is not None]
+        return min(candidates) if candidates else None
+
+
         clauses: list[str] = []
         params: list[Any] = []
         if customer_id:
@@ -1671,24 +2266,39 @@ class Store:
         :meth:`withdraw_topic`.  Returns ``False`` when withdrawal (or a newer
         lease) won the race, in which case the worker must not send.
         """
+        return self.begin_send(claim, now=now) is not None
+
+    def begin_send(self, claim: ClaimedDelivery, *, now: float) -> ClaimedDelivery | None:
+        """Like :meth:`mark_sending` but returns the (auth-stamped) claim the
+        worker must actually send, or ``None`` to not send.
+
+        For a topic callback to a participating receiver the returned claim
+        carries a fresh monotonic authorization sequence, which the sender
+        puts in the request.  After the receiver has processed an erasure
+        request it rejects any callback authorized at or below the erasure
+        watermark, so an in-flight pre-withdrawal callback cannot recreate a
+        deleted replica no matter when its HTTP request lands.
+        """
         with self._write() as conn:
             row = conn.execute(
                 "SELECT status, lease_token, billable, credit_stage FROM deliveries WHERE id=?",
                 (claim.id,),
             ).fetchone()
             if row is None or row["status"] != "in_progress" or row["lease_token"] != claim.lease_token:
-                return False
+                return None
             event = conn.execute(
-                """SELECT e.status AS event_status, t.status AS topic_status
+                """SELECT e.status AS event_status, e.topic_id AS event_topic_id,
+                          t.status AS topic_status
                    FROM events e
                    LEFT JOIN topics t ON t.customer_id = e.customer_id AND t.topic_id = e.topic_id
                    WHERE e.id=?""",
                 (claim.event_id,),
             ).fetchone()
+            event_topic_id = event["event_topic_id"] if event is not None else None
             if event is None or event["event_status"] == "withdrawn":
-                return False
+                return None
             if event["topic_status"] == "withdrawn":
-                return False
+                return None
             # ---- prepaid point gate -------------------------------------
             # A billable delivery may only hand a request to the sender while
             # it owns a point.  The allocation is written in the same write
@@ -1703,37 +2313,98 @@ class Store:
                         # No point available: leave it claimed but unsent, so
                         # the worker can park it for supply without spending a
                         # retry.  It is not failed.
-                        return False
+                        return None
                 elif stage != "held":
                     # charged / reconciliation / returned / expired: no point
                     # is free for another send under this delivery_id.
-                    return False
+                    return None
                 # Re-check the lease after allocating, so a concurrent recovery
                 # cannot have handed this work to another worker meanwhile.
                 lease = conn.execute(
                     "SELECT lease_token FROM deliveries WHERE id=?", (claim.id,)
                 ).fetchone()
                 if lease is None or lease["lease_token"] != claim.lease_token:
-                    return False
+                    return None
             cur = conn.execute(
                 """UPDATE attempts SET send_started_at=?
                    WHERE id=? AND outcome='in_flight' AND send_started_at IS NULL""",
                 (now, claim.attempt_id),
             )
-            if cur.rowcount == 1:
-                return True
-            attempt = conn.execute(
-                "SELECT send_started_at, outcome FROM attempts WHERE id=?",
-                (claim.attempt_id),
-            ).fetchone()
-            if attempt is None:
-                # No attempt row exists (e.g. a hand-built claim in a unit
-                # test).  The delivery/topic checks above are the fence; the
-                # finish path re-checks withdrawal as well.
-                return True
-            # Re-entrant gate for an already-marked attempt is allowed; an
-            # attempt that was closed (e.g. withdrawn pre-send) stays blocked.
-            return attempt["send_started_at"] is not None
+            attempt = None
+            if cur.rowcount != 1:
+                attempt = conn.execute(
+                    "SELECT send_started_at, outcome FROM attempts WHERE id=?",
+                    (claim.attempt_id,),
+                ).fetchone()
+                if attempt is not None and attempt["send_started_at"] is None:
+                    # The attempt was closed without ever sending (e.g. it was
+                    # withdrawn pre-send): no request will be made.
+                    return None
+                # A missing attempt row means a hand-built/test claim; the
+                # delivery/topic checks above are the fence.  An already-marked
+                # attempt is a re-entrant gate, which is allowed.
+            # ---- external replica erasure obligation -------------------
+            # Every gate above has passed and a request is about to be handed to
+            # the sender.  Record the obligation for a participating receiver
+            # *now*, inside this write transaction and before any HTTP happens,
+            # so a later withdrawal includes it whether the callback succeeds,
+            # fails, is still in flight, or is superseded.  Re-entering the gate
+            # may advance the watermark again, which is harmless.
+            if claim.erasure_receiver_id is not None and event_topic_id is not None:
+                auth_seq = self._record_erasure_obligation(
+                    conn,
+                    customer_id=claim.customer_id,
+                    topic_id=str(event_topic_id),
+                    receiver_id=claim.erasure_receiver_id,
+                    now=now,
+                )
+                claim = replace(claim, auth_seq=auth_seq, topic_id=str(event_topic_id))
+            return claim
+
+    def _record_erasure_obligation(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        customer_id: str,
+        topic_id: str,
+        receiver_id: str,
+        now: float,
+    ) -> int:
+        """Record that the worker is authorized to send a topic callback to
+        ``receiver_id`` for ``(customer, topic)``.
+
+        Called in the same ``BEGIN IMMEDIATE`` transaction as the send fence,
+        *before* any HTTP request is handed to the sender.  Once written the
+        obligation is never deleted: a failed, timed-out, superseded or
+        still-in-flight callback still leaves a remote replica that the
+        receiver must erase.  Returns the freshly issued authorization
+        sequence number (a per-topic monotonic watermark) for this send.
+        """
+        conn.execute(
+            "INSERT OR IGNORE INTO counters(name, value) VALUES ('erasure_auth', 0)"
+        )
+        conn.execute(
+            "UPDATE counters SET value = value + 1 WHERE name='erasure_auth'"
+        )
+        seq = int(
+            conn.execute("SELECT value FROM counters WHERE name='erasure_auth'").fetchone()[
+                "value"
+            ]
+        )
+        conn.execute(
+            """INSERT INTO erasure_obligations
+                   (customer_id, topic_id, receiver_id,
+                    first_authorized_at, last_authorized_at,
+                    max_auth_seq, authorization_count)
+               VALUES (?,?,?,?,?,?,1)
+               ON CONFLICT(customer_id, topic_id, receiver_id) DO UPDATE SET
+                   last_authorized_at = excluded.last_authorized_at,
+                   max_auth_seq = MAX(erasure_obligations.max_auth_seq, excluded.max_auth_seq),
+                   authorization_count = erasure_obligations.authorization_count + 1""",
+            (customer_id, topic_id, receiver_id, now, now, seq),
+        )
+        # Also stamp the current attempt so the callback carries this number.
+        return seq
 
     # ------------------------------------------------------------------ work
     def claim_due(self, *, now: float, lease_seconds: float, limit: int = 8) -> list[ClaimedDelivery]:
@@ -1743,7 +2414,9 @@ class Store:
         with self._write() as conn:
             rows = conn.execute(
                 f"""SELECT d.*, e.caller_event_id AS caller_event_id,
-                          e.payload_json AS payload_json, e.created_at AS event_created_at
+                          e.payload_json AS payload_json,
+                          e.created_at AS event_created_at,
+                          e.topic_id AS topic_id
                    FROM deliveries d JOIN events e ON e.id = d.event_id
                    WHERE d.status IN ('pending','retry_wait')
                      AND e.status != 'withdrawn'
@@ -1766,18 +2439,25 @@ class Store:
                 if row["lease_token"] and row["lease_until"] and row["lease_until"] > now:
                     continue
                 sub = conn.execute(
-                    "SELECT target_url, target_version FROM subscriptions WHERE id=?",
+                    """SELECT target_url, target_version, erasure_receiver_id
+                       FROM subscriptions WHERE id=?""",
                     (row["subscription_id"],),
                 ).fetchone()
                 token = new_id("lease")
                 attempt_seq = int(row["attempt_seq"]) + 1
                 attempts_count = int(row["attempts_count"]) + 1
                 attempt_id = new_id("att")
+                # Only a topic-bearing callback aimed at a participating
+                # receiver is in the erasure protocol; otherwise this delivery
+                # must behave exactly like an ordinary target.
+                erasure_receiver_id = (
+                    sub["erasure_receiver_id"] if row["topic_id"] is not None else None
+                )
                 cur = conn.execute(
                     """UPDATE deliveries
                        SET status='in_progress', lease_token=?, lease_until=?,
                            attempt_seq=?, attempts_count=?, target_url=?, target_version=?,
-                           block_reason=NULL, updated_at=?
+                           erasure_receiver_id=?, block_reason=NULL, updated_at=?
                        WHERE id=? AND status IN ('pending','retry_wait')
                          AND (lease_token IS NULL OR lease_until IS NULL OR lease_until <= ?)""",
                     (
@@ -1787,6 +2467,7 @@ class Store:
                         attempts_count,
                         sub["target_url"],
                         sub["target_version"],
+                        erasure_receiver_id,
                         now,
                         row["id"],
                         now,
@@ -1826,6 +2507,8 @@ class Store:
                         payload_json=row["payload_json"],
                         event_created_at=float(row["event_created_at"]),
                         billable=bool(row["billable"]),
+                        erasure_receiver_id=erasure_receiver_id,
+                        topic_id=row["topic_id"],
                     )
                 )
         return claimed
@@ -2293,6 +2976,9 @@ class Store:
             "attempts_count": row["attempts_count"],
             "target_url": row["target_url"],
             "target_version": row["target_version"],
+            "erasure_receiver_id": row["erasure_receiver_id"]
+            if "erasure_receiver_id" in row.keys()
+            else None,
             "subscription_target": {
                 "target_url": sub["target_url"],
                 "target_version": sub["target_version"],

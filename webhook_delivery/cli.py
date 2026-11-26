@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Sequence
 
 from .config import Settings
@@ -106,6 +107,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--limit", type=int, default=100)
     p_ev.set_defaults(op="list-events")
 
+    # ---- external replica erasure ------------------------------------------
+    p_reg = sub.add_parser(
+        "register-erasure-receiver", parents=[common],
+        help="Register a participating external receiver for a customer",
+    )
+    p_reg.add_argument("--customer", required=True)
+    p_reg.add_argument("--url", required=True)
+    p_reg.set_defaults(op="register-erasure-receiver")
+
+    p_ler = sub.add_parser("list-erasure-receivers", parents=[common])
+    p_ler.add_argument("--customer")
+    p_ler.set_defaults(op="list-erasure-receivers")
+
+    p_eps = sub.add_parser("erasure-progress", parents=[common],
+                           help="Show which receivers acknowledged a withdrawal's erasure")
+    p_eps.add_argument("--customer", required=True)
+    p_eps.add_argument("--topic", required=True)
+    p_eps.set_defaults(op="erasure-progress")
+
+    p_lerq = sub.add_parser("list-erasure-requests", parents=[common])
+    p_lerq.add_argument("--customer")
+    p_lerq.add_argument("--status", choices=["pending", "in_progress", "retry_wait", "failed", "acknowledged"])
+    p_lerq.set_defaults(op="list-erasure-requests")
+
+    p_rer = sub.add_parser("retry-erasure", parents=[common],
+                           help="Re-queue a parked erasure request (same operation id)")
+    p_rer.add_argument("--erasure", required=True)
+    p_rer.add_argument("--reason", required=True)
+    p_rer.add_argument("--actor", default="ops")
+    p_rer.set_defaults(op="retry-erasure")
+
     return parser
 
 
@@ -151,6 +183,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flow_id=args.flow,
                     topic_id=args.topic,
                     limit=args.limit,
+                )
+            )
+        elif args.op == "register-erasure-receiver":
+            _print(
+                store.register_erasure_receiver(
+                    customer_id=args.customer, url=args.url, now=time.time()
+                )
+            )
+        elif args.op == "list-erasure-receivers":
+            _print(store.list_erasure_receivers(customer_id=args.customer))
+        elif args.op == "erasure-progress":
+            _print(store.get_topic_erasure(customer_id=args.customer, topic_id=args.topic))
+        elif args.op == "list-erasure-requests":
+            _print(
+                store.list_erasure_requests(customer_id=args.customer, status=args.status)
+            )
+        elif args.op == "retry-erasure":
+            _print(
+                store.retry_erasure(
+                    args.erasure, now=time.time(), reason=args.reason, actor=args.actor
                 )
             )
         else:  # pragma: no cover - argparse guarantees a command
